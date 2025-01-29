@@ -1,6 +1,5 @@
 import discord
 from discord.ext import commands
-from discord import app_commands
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
@@ -55,7 +54,7 @@ async def remove_recent(interaction: discord.Interaction):
 
         sheet.update([["", "", ""]], f"B{last_row}:D{last_row}")
 
-        await interaction.response.send_message("Removed the most recent entry from columns B, C, and D.")
+        await interaction.response.send_message("Removed the most recent entry.")
     except Exception as e:
         await interaction.response.send_message(f"An error occurred: {e}")
 
