@@ -3,10 +3,16 @@ from discord.ext import commands
 from discord import app_commands
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-credentials = ServiceAccountCredentials.from_json_keyfile_name(
-    "/Users/joshamstutz/Downloads/financebro-449105-fc40e9fd863a.json", scope)
+credentials = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
 client = gspread.authorize(credentials)
 
 spreadsheet = client.open('hackerfinance')
@@ -15,46 +21,50 @@ sheet = spreadsheet.sheet1
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-
-# commands
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f'Logged in as {bot.user}')
+    print(f'financeBRO ready to crunch numbers')
 
-
-# adds spreadsheet record
-@bot.tree.command(name="add", description="Add data to the sheet")
-async def add(interaction: discord.Interaction, data: str):
-    # splits name, memo, and amount
+@bot.tree.command(name="add_record", description="Add data to the sheet")
+async def add(interaction: discord.Interaction, name: str, memo: str, amount: str):
     try:
-        name, memo, amount = data.split(',')
-
         column_b = sheet.col_values(2)[2:]
+        row_number = 3 + len(column_b)
 
-        # first empty row in column B
-        row_number = 3 + len(column_b)  # adding 3 since B3 is first available
+        sheet.update_cell(row_number, 2, name)
+        sheet.update_cell(row_number, 3, memo)
+        sheet.update_cell(row_number, 4, amount)
 
-        # Insert data into the first available row in columns B, C, and D
-        sheet.update_cell(row_number, 2, name)  # column B
-        sheet.update_cell(row_number, 3, memo)  # column C
-        sheet.update_cell(row_number, 4, amount)  # column D
-
-        await interaction.response.send_message(f'Added data: Name: {name}, Memo: {memo}, Amount: {amount}')
-    except ValueError:
-        await interaction.response.send_message("Please provide the data in the correct format: name,memo,amount")
-
-
-# views total (probably gonna be private)
-@bot.tree.command(name="view", description="View data from the sheet")
-async def view(interaction: discord.Interaction):
-    try:
-        # H3 is "total" cell
-        total = sheet.acell('H3').value
-        await interaction.response.send_message(f'Total: {total}')
+        await interaction.response.send_message(f'Added record:\nName: **{name}**\nMemo: **{memo}**\nAmount: **{amount}**')
     except Exception as e:
         await interaction.response.send_message(f"An error occurred: {e}")
 
+@bot.tree.command(name="remove_recent", description="Remove the most recent entry from the sheet")
+async def remove_recent(interaction: discord.Interaction):
+    try:
+        column_b = sheet.col_values(2)[2:]
+        column_c = sheet.col_values(3)[2:]
+        column_d = sheet.col_values(4)[2:]
 
-# bot token
-bot.run("MTMzMzU5Njc5MzA3Nzg5MTIwNQ.G-MGFg.0fa3i6Dke_dzxYu3AEaIqBdtVUcIaaBSlhGS20")
+        last_row = 2 + max(len(column_b), len(column_c), len(column_d))
+
+        if last_row <= 2:
+            await interaction.response.send_message("No entries to remove.")
+            return
+
+        sheet.update([["", "", ""]], f"B{last_row}:D{last_row}")
+
+        await interaction.response.send_message("Removed the most recent entry from columns B, C, and D.")
+    except Exception as e:
+        await interaction.response.send_message(f"An error occurred: {e}")
+
+@bot.tree.command(name="view_total", description="View total budget after expenses/credits from the sheet")
+async def view(interaction: discord.Interaction):
+    try:
+        total = sheet.acell('H3').value
+        await interaction.response.send_message(f'Total: **{total}**')
+    except Exception as e:
+        await interaction.response.send_message(f"An error occurred: {e}")
+
+bot.run(DISCORD_BOT_TOKEN)
