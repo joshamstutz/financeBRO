@@ -5,18 +5,24 @@ from oauth2client.service_account import ServiceAccountCredentials
 import os
 from dotenv import load_dotenv
 import asyncio
+import requests
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 load_dotenv()
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 credentials = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_PATH, scope)
-client = gspread.authorize(credentials)
 
+client = gspread.authorize(credentials)
 spreadsheet = client.open('hackerfinance')
 sheet = spreadsheet.sheet1
+
+drive_service = build('drive', 'v3', credentials=credentials)
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -24,24 +30,50 @@ intents.guilds = True
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Store users waiting for image uploads
 waiting_for_image = {}
 
 
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    # Start the cleanup task after the bot is ready and the event loop is running
     cleanup_waiting_list.start()
     print(f'financeBRO ready to crunch numbers')
 
 
-async def get_last_image(channel):
-    async for message in channel.history(limit=20):
-        if message.attachments:
-            for attachment in message.attachments:
-                if attachment.filename.lower().endswith((".jpg", ".jpeg", ".png")):
-                    return attachment.url
+async def upload_to_drive(image_url, filename):
+    response = requests.get(image_url)
+    if response.status_code == 200:
+        file_path = f"./{filename}"
+        with open(file_path, "wb") as file:
+            file.write(response.content)
+
+        try:
+            file_metadata = {
+                'name': filename,
+                'parents': [GOOGLE_DRIVE_FOLDER_ID]
+            }
+
+            media = MediaFileUpload(file_path, resumable=True)
+            file = drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id,webViewLink'
+            ).execute()
+
+            drive_service.permissions().create(
+                fileId=file.get('id'),
+                body={'type': 'anyone', 'role': 'reader'},
+                fields='id'
+            ).execute()
+
+            os.remove(file_path)
+
+            return file.get('webViewLink')
+        except Exception as e:
+            print(f"Drive upload error: {e}")
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            return None
     return None
 
 
@@ -54,7 +86,7 @@ async def add(interaction: discord.Interaction, name: str, memo: str, date: str,
         amount_value = float(amount.lstrip('+')) if amount.lstrip('+-').replace('.', '', 1).isdigit() else amount
         if not amount.startswith("+"):
             amount_value = -abs(amount_value)
-        formatted_amount = f"${amount_value}" if amount_value >= 0 else f"-{abs(amount_value)}"
+        formatted_amount = f"${amount_value}" if amount_value >= 0 else f"-${abs(amount_value)}"
 
         sheet.update_cell(id_num, 1, id_num)
         sheet.update_cell(id_num, 2, name)
@@ -62,12 +94,10 @@ async def add(interaction: discord.Interaction, name: str, memo: str, date: str,
         sheet.update_cell(id_num, 4, date)
         sheet.update_cell(id_num, 5, amount_value)
         sheet.update_cell(id_num, 7, "N")
-        # Don't add any image URL yet - wait for user to upload one
 
-        # Store the user's ID and record ID for future image upload
         waiting_for_image[interaction.user.id] = {
             "record_id": id_num,
-            "expires_at": asyncio.get_event_loop().time() + 300  # 5 minutes timeout
+            "expires_at": asyncio.get_event_loop().time() + 300
         }
 
         await interaction.response.send_message(
@@ -82,40 +112,43 @@ async def add(interaction: discord.Interaction, name: str, memo: str, date: str,
     except Exception as e:
         await interaction.response.send_message(f"an error occurred: {e}")
 
+
 @bot.event
 async def on_message(message):
-    # Skip bot messages
     if message.author.bot:
         return
 
-    # Check if the user is waiting for an image upload
     if message.author.id in waiting_for_image:
         record_info = waiting_for_image[message.author.id]
 
-        # Check if the waiting period has expired
         if asyncio.get_event_loop().time() > record_info["expires_at"]:
             del waiting_for_image[message.author.id]
             return
 
-        # Check if the message contains an image attachment
         if message.attachments:
             for attachment in message.attachments:
                 if attachment.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+                    processing_msg = await message.channel.send("Uploading receipt to Google Drive...")
+
                     try:
-                        # Update the spreadsheet with the image URL
-                        record_id = record_info["record_id"]
-                        sheet.update_cell(record_id, 13, attachment.url)
+                        drive_link = await upload_to_drive(attachment.url, attachment.filename)
 
-                        # Send confirmation message
-                        await message.channel.send(f"receipt added to record **{record_id}**!")
+                        if drive_link:
+                            record_id = record_info["record_id"]
+                            sheet.update_cell(record_id, 13, drive_link)
 
-                        # Remove the user from the waiting list
+                            await processing_msg.edit(
+                                content=f"Receipt uploaded to Google Drive and added to record **{record_id}**!\n{drive_link}")
+                        else:
+                            await processing_msg.edit(content="Error uploading receipt to Google Drive.")
+
                         del waiting_for_image[message.author.id]
                         return
                     except Exception as e:
-                        await message.channel.send(f"Error adding image to record: {e}")
+                        await processing_msg.edit(content=f"Error: {str(e)}")
+                        del waiting_for_image[message.author.id]
+                        return
 
-    # Process commands
     await bot.process_commands(message)
 
 
@@ -135,18 +168,14 @@ async def reimburse(interaction: discord.Interaction, record_id: int):
 @bot.tree.command(name="status", description="Check the reimbursement status of a record")
 async def status(interaction: discord.Interaction, record_id: int):
     try:
-        # Find the cell with the record ID
         cell = sheet.find(str(record_id))
 
         if cell and cell.col == 1:
-            # Get the status from column F (column 7)
             status = sheet.cell(cell.row, 7).value
 
-            # Format the status message
             status_text = "Reimbursed" if status == "Y" else "Pending"
             status_emoji = "✅" if status == "Y" else "⏳"
 
-            # Send the status information
             await interaction.response.send_message(
                 f"**Status for record {record_id}**: {status_emoji} {status_text}\n"
             )
@@ -156,7 +185,6 @@ async def status(interaction: discord.Interaction, record_id: int):
         await interaction.response.send_message(f"An error occurred: {e}")
 
 
-# Clean up expired waiting records every minute
 @tasks.loop(minutes=1)
 async def cleanup_waiting_list():
     current_time = asyncio.get_event_loop().time()
@@ -172,5 +200,4 @@ async def before_cleanup():
     await bot.wait_until_ready()
 
 
-# Run the bot
 bot.run(DISCORD_BOT_TOKEN)
